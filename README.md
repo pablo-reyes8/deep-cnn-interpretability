@@ -1,4 +1,4 @@
-# 🐾 ResNet-101: Cat vs Dog Classification with Interpretability
+#  ResNet-101: Cat vs Dog Classification with Interpretability
 
 ![Repo size](https://img.shields.io/github/repo-size/SPMINE-2425/proyecto-final-reyes-castano)
 ![Last commit](https://img.shields.io/github/last-commit/SPMINE-2425/proyecto-final-reyes-castano)
@@ -12,7 +12,7 @@ The goal is to provide an advanced, reliable classification and explanation tool
 
 ---
 
-## 🎯 Objectives
+##  Objectives
 
 - **Binary classification** (cat vs. dog) on user-supplied images (local file or URL).
 - **Advanced interpretability** to inspect the model’s decision per image:
@@ -24,7 +24,7 @@ The goal is to provide an advanced, reliable classification and explanation tool
 
 ---
 
-## 🧩 Main Components
+##  Main Components
 
 - **`resnet101/`** — model implementation (from scratch) and experiment artifacts
 
@@ -53,7 +53,7 @@ The goal is to provide an advanced, reliable classification and explanation tool
 
 ---
 
-## 🔐 Weights & Data
+##  Weights & Data
 
 - **Model weights** must be downloaded from [**MODEL**](https://drive.google.com/file/d/1j_MgSHO_bTxhc_Z8Zxt5rJXQJOEIzXuE/view?usp=sharing) and placed in the path: **`resnet101/model_trained`**.
 - **Datasets** must comply with their original licenses. This project uses **Oxford-IIIT Pet** strictly for educational purposes.
@@ -112,7 +112,7 @@ The goal is to provide an advanced, reliable classification and explanation tool
 
 ---
 
-## 🔧 Installation & Execution
+##  Installation & Execution
 
 > Minimum requirements: **Python 3.11+** (if using Poetry), **Git**.  
 > Recommended alternative: **Docker** + **Docker Compose** (no need to install Python or Poetry locally).
@@ -213,7 +213,7 @@ docker compose down
 
 ---
 
-## 🗺️ Exposed Routes (API)
+##  Exposed Routes (API)
 
 - `GET /health` → Service status
 - `POST /predict` → Basic prediction: `label`, `scores`, `meta`
@@ -221,7 +221,7 @@ docker compose down
 
 ---
 
-## 🔍 Inference Flow
+##  Inference Flow
 
 1. **Input**: file or URL → validation (MIME/shape)
 2. **Preprocessing**: resize/center-crop → normalized tensor (cached statistics)
@@ -237,7 +237,7 @@ docker compose down
 
 ---
 
-## 📊 Benchmark Metrics (Validation)
+##  Benchmark Metrics (Validation)
 
 <div align="center">
 
@@ -319,7 +319,7 @@ docker compose down
 
 ---
 
-## ⚙️ Reproducibility
+##  Reproducibility
 
 - Centralized **YAML** config (dataset, normalization, architecture, optimizer, scheduler).
 - Normalization statistics cached in `data/pet_stats.json`.
