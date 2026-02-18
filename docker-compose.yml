@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: docker/ingestion.Dockerfile
     command: >-
-      python3 -m resnet101.src.data.ingest_data
+      python3 resnet101/scripts/cli_ingest.py
       --data-dir /workspace/data
       --stats-path /workspace/data/pet_stats.json
       --report-path /workspace/monitoring/ingestion_report.json
@@ -18,7 +18,7 @@ services:
       context: .
       dockerfile: docker/training.Dockerfile
     command: >-
-      python3 -m resnet101.src.training.train_mlflow
+      python3 resnet101/scripts/cli_train.py
       --config /workspace/resnet101/oxford_pets_binary_resnet101.yaml
       --output-dir /workspace/resnet101/model_trained/mlops
       --tracking-uri file:/workspace/resnet101/mlruns
@@ -35,7 +35,7 @@ services:
     build:
       context: .
       dockerfile: docker/deploy.Dockerfile
-    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+    command: python3 scripts/run_api.py --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
     environment:

@@ -18,7 +18,6 @@ def _project_root() -> Path:
     env_root = os.environ.get("PROJECT_ROOT")
     if env_root:
         return Path(env_root).resolve()
-    # <repo>/airflow/dags/this_file.py -> repo root is parents[2]
     return Path(__file__).resolve().parents[2]
 
 
@@ -42,52 +41,54 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _branch_bootstrap() -> str:
     root = _project_root()
     candidate_paths = [
-        root / "resnet101" / "model_trained" / "mlops" / "best_model.pth",
         root / "resnet101" / "model_trained" / "ResNet101.pth",
+        root / "monitoring" / "deployment_state.json",
     ]
     if any(p.exists() for p in candidate_paths):
         return "bootstrap_skip"
     return "bootstrap_ingestion"
 
 
-def _branch_retrain() -> str:
+def _branch_retrain_need() -> str:
     mdir = _monitoring_dir()
     drift_report = _read_json(mdir / "drift_report.json")
     health_report = _read_json(mdir / "model_health_report.json")
-
     drift_detected = bool(drift_report.get("drift_detected", False))
     model_degraded = bool(health_report.get("degraded", False))
-
     if drift_detected or model_degraded:
-        return "trigger_retraining"
+        return "retrain_training"
     return "skip_retraining"
+
+
+def _branch_quality_gate(report_file: str, pass_task_id: str, fail_task_id: str) -> str:
+    report = _read_json(_monitoring_dir() / report_file)
+    return pass_task_id if bool(report.get("gate_passed", False)) else fail_task_id
+
+
+def _branch_post_deploy_health(report_file: str, healthy_task_id: str, rollback_task_id: str) -> str:
+    report = _read_json(_monitoring_dir() / report_file)
+    degraded = bool(report.get("degraded", False))
+    status = str(report.get("status", "unknown"))
+    if degraded and status in {"ok", "stale"}:
+        return rollback_task_id
+    return healthy_task_id
 
 
 def _write_orchestration_report(**context):
     mdir = _monitoring_dir()
     mdir.mkdir(parents=True, exist_ok=True)
 
-    drift_report = _read_json(mdir / "drift_report.json")
-    health_report = _read_json(mdir / "model_health_report.json")
-
-    dag_run = context.get("dag_run")
-    run_id = dag_run.run_id if dag_run else "unknown"
-    execution_date = str(context.get("ds"))
-
     report = {
         "timestamp_utc": datetime.utcnow().isoformat() + "Z",
-        "run_id": run_id,
-        "execution_date": execution_date,
-        "decision": {
-            "drift_detected": bool(drift_report.get("drift_detected", False)),
-            "model_degraded": bool(health_report.get("degraded", False)),
-        },
-        "drift_report": drift_report,
-        "health_report": health_report,
+        "run_id": context.get("dag_run").run_id if context.get("dag_run") else "unknown",
+        "execution_date": str(context.get("ds")),
+        "drift_report": _read_json(mdir / "drift_report.json"),
+        "health_report": _read_json(mdir / "model_health_report.json"),
+        "bootstrap_quality_gate": _read_json(mdir / "quality_gate_report_bootstrap.json"),
+        "retrain_quality_gate": _read_json(mdir / "quality_gate_report_retrain.json"),
+        "deployment_state": _read_json(mdir / "deployment_state.json"),
     }
-    (mdir / "orchestration_report.json").write_text(
-        json.dumps(report, indent=2), encoding="utf-8"
-    )
+    (mdir / "orchestration_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
 ROOT = _project_root()
@@ -103,13 +104,13 @@ default_args = {
 with DAG(
     dag_id="resnet101_mlops_orchestrator",
     default_args=default_args,
-    description="Orquestacion MLOps: bootstrap, monitoreo, drift/model health y reentrenamiento condicional.",
+    description="Orquestacion MLOps con quality gates, promotion y rollback automatico.",
     start_date=datetime(2026, 2, 18),
     schedule="0 */2 * * *",
     catchup=False,
     max_active_runs=1,
-    dagrun_timeout=timedelta(hours=3),
-    tags=["mlops", "resnet101", "drift", "retraining"],
+    dagrun_timeout=timedelta(hours=4),
+    tags=["mlops", "resnet101", "quality-gates", "rollback"],
 ) as dag:
     bootstrap_decision = BranchPythonOperator(
         task_id="bootstrap_decision",
@@ -118,41 +119,131 @@ with DAG(
 
     bootstrap_ingestion = BashOperator(
         task_id="bootstrap_ingestion",
-        bash_command=(
-            f"cd {ROOT} && "
-            f"docker compose -f {COMPOSE} run --rm ingestion"
-        ),
+        bash_command=f"cd {ROOT} && docker compose -f {COMPOSE} run --rm ingestion",
     )
 
     bootstrap_training = BashOperator(
         task_id="bootstrap_training",
+        bash_command=f"cd {ROOT} && docker compose -f {COMPOSE} run --rm training",
+    )
+
+    bootstrap_quality_gate = BashOperator(
+        task_id="bootstrap_quality_gate",
         bash_command=(
             f"cd {ROOT} && "
-            f"docker compose -f {COMPOSE} run --rm training"
+            "python3 -m src.mlops.quality_gate "
+            "--candidate-metrics-path resnet101/model_trained/mlops/metrics.json "
+            "--candidate-model-path resnet101/model_trained/mlops/best_model.pth "
+            "--state-path monitoring/deployment_state.json "
+            "--report-path monitoring/quality_gate_report_bootstrap.json "
+            "--history-path monitoring/quality_gate_history.jsonl "
+            "--exit-code-on-fail 0"
+        ),
+    )
+
+    bootstrap_gate_decision = BranchPythonOperator(
+        task_id="bootstrap_gate_decision",
+        python_callable=_branch_quality_gate,
+        op_kwargs={
+            "report_file": "quality_gate_report_bootstrap.json",
+            "pass_task_id": "bootstrap_promote",
+            "fail_task_id": "bootstrap_gate_failed_rollback",
+        },
+    )
+
+    bootstrap_promote = BashOperator(
+        task_id="bootstrap_promote",
+        bash_command=(
+            f"cd {ROOT} && "
+            "python3 -m src.mlops.deployment_manager "
+            "--action promote "
+            "--gate-report-path monitoring/quality_gate_report_bootstrap.json "
+            "--candidate-model-path resnet101/model_trained/mlops/best_model.pth "
+            "--target-model-path resnet101/model_trained/ResNet101.pth "
+            "--state-path monitoring/deployment_state.json "
+            "--deployment-history-path monitoring/deployment_history.jsonl "
+            "--rollback-history-path monitoring/rollback_history.jsonl "
+            "--backup-dir resnet101/model_trained/backups"
         ),
     )
 
     bootstrap_deploy = BashOperator(
         task_id="bootstrap_deploy",
+        bash_command=f"cd {ROOT} && docker compose -f {COMPOSE} up -d deploy",
+    )
+
+    bootstrap_post_deploy_health = BashOperator(
+        task_id="bootstrap_post_deploy_health",
         bash_command=(
             f"cd {ROOT} && "
-            f"docker compose -f {COMPOSE} up -d deploy"
+            f"docker compose -f {COMPOSE} exec -T deploy "
+            "python3 -m src.mlops.evaluate_model_health "
+            "--inference-log-path /workspace/monitoring/inference_events.jsonl "
+            "--feedback-log-path /workspace/monitoring/feedback_events.jsonl "
+            "--report-path /workspace/monitoring/post_deploy_health_bootstrap.json "
+            "--window-size 200 "
+            "--min-samples 20 "
+            "--min-avg-confidence 0.55 "
+            "--uncertain-threshold 0.50 "
+            "--max-uncertain-rate 0.45 "
+            "--min-feedback-samples 10 "
+            "--min-feedback-accuracy 0.75"
+        ),
+    )
+
+    bootstrap_post_deploy_decision = BranchPythonOperator(
+        task_id="bootstrap_post_deploy_decision",
+        python_callable=_branch_post_deploy_health,
+        op_kwargs={
+            "report_file": "post_deploy_health_bootstrap.json",
+            "healthy_task_id": "bootstrap_ready",
+            "rollback_task_id": "bootstrap_rollback",
+        },
+    )
+
+    bootstrap_rollback = BashOperator(
+        task_id="bootstrap_rollback",
+        bash_command=(
+            f"cd {ROOT} && "
+            "python3 -m src.mlops.deployment_manager "
+            "--action rollback "
+            "--target-model-path resnet101/model_trained/ResNet101.pth "
+            "--state-path monitoring/deployment_state.json "
+            "--rollback-history-path monitoring/rollback_history.jsonl "
+            "--reason bootstrap_post_deploy_degraded "
+            "--allow-noop-rollback"
+        ),
+    )
+
+    bootstrap_redeploy_after_rollback = BashOperator(
+        task_id="bootstrap_redeploy_after_rollback",
+        bash_command=f"cd {ROOT} && docker compose -f {COMPOSE} up -d deploy",
+    )
+
+    bootstrap_gate_failed_rollback = BashOperator(
+        task_id="bootstrap_gate_failed_rollback",
+        bash_command=(
+            f"cd {ROOT} && "
+            "python3 -m src.mlops.deployment_manager "
+            "--action rollback "
+            "--target-model-path resnet101/model_trained/ResNet101.pth "
+            "--state-path monitoring/deployment_state.json "
+            "--rollback-history-path monitoring/rollback_history.jsonl "
+            "--reason bootstrap_quality_gate_failed "
+            "--allow-noop-rollback"
         ),
     )
 
     bootstrap_skip = EmptyOperator(task_id="bootstrap_skip")
 
-    bootstrap_join = EmptyOperator(
-        task_id="bootstrap_join",
+    bootstrap_ready = EmptyOperator(
+        task_id="bootstrap_ready",
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
-    ensure_deploy = BashOperator(
+    ensure_deploy_running = BashOperator(
         task_id="ensure_deploy_running",
-        bash_command=(
-            f"cd {ROOT} && "
-            f"docker compose -f {COMPOSE} up -d deploy"
-        ),
+        bash_command=f"cd {ROOT} && docker compose -f {COMPOSE} up -d deploy",
     )
 
     detect_drift = BashOperator(
@@ -173,7 +264,7 @@ with DAG(
         ),
     )
 
-    evaluate_health = BashOperator(
+    evaluate_model_health = BashOperator(
         task_id="evaluate_model_health",
         bash_command=(
             f"cd {ROOT} && "
@@ -195,46 +286,151 @@ with DAG(
 
     retrain_decision = BranchPythonOperator(
         task_id="retrain_decision",
-        python_callable=_branch_retrain,
+        python_callable=_branch_retrain_need,
     )
 
-    trigger_retraining = BashOperator(
-        task_id="trigger_retraining",
+    retrain_training = BashOperator(
+        task_id="retrain_training",
+        bash_command=f"cd {ROOT} && docker compose -f {COMPOSE} run --rm training",
+    )
+
+    retrain_quality_gate = BashOperator(
+        task_id="retrain_quality_gate",
         bash_command=(
             f"cd {ROOT} && "
-            f"docker compose -f {COMPOSE} run --rm training"
+            "python3 -m src.mlops.quality_gate "
+            "--candidate-metrics-path resnet101/model_trained/mlops/metrics.json "
+            "--candidate-model-path resnet101/model_trained/mlops/best_model.pth "
+            "--state-path monitoring/deployment_state.json "
+            "--report-path monitoring/quality_gate_report_retrain.json "
+            "--history-path monitoring/quality_gate_history.jsonl "
+            "--exit-code-on-fail 0"
+        ),
+    )
+
+    retrain_gate_decision = BranchPythonOperator(
+        task_id="retrain_gate_decision",
+        python_callable=_branch_quality_gate,
+        op_kwargs={
+            "report_file": "quality_gate_report_retrain.json",
+            "pass_task_id": "retrain_promote",
+            "fail_task_id": "retrain_gate_failed_rollback",
+        },
+    )
+
+    retrain_promote = BashOperator(
+        task_id="retrain_promote",
+        bash_command=(
+            f"cd {ROOT} && "
+            "python3 -m src.mlops.deployment_manager "
+            "--action promote "
+            "--gate-report-path monitoring/quality_gate_report_retrain.json "
+            "--candidate-model-path resnet101/model_trained/mlops/best_model.pth "
+            "--target-model-path resnet101/model_trained/ResNet101.pth "
+            "--state-path monitoring/deployment_state.json "
+            "--deployment-history-path monitoring/deployment_history.jsonl "
+            "--rollback-history-path monitoring/rollback_history.jsonl "
+            "--backup-dir resnet101/model_trained/backups"
         ),
     )
 
     rollout_new_model = BashOperator(
         task_id="rollout_new_model",
+        bash_command=f"cd {ROOT} && docker compose -f {COMPOSE} up -d deploy",
+    )
+
+    retrain_post_deploy_health = BashOperator(
+        task_id="retrain_post_deploy_health",
         bash_command=(
             f"cd {ROOT} && "
-            f"docker compose -f {COMPOSE} up -d deploy"
+            f"docker compose -f {COMPOSE} exec -T deploy "
+            "python3 -m src.mlops.evaluate_model_health "
+            "--inference-log-path /workspace/monitoring/inference_events.jsonl "
+            "--feedback-log-path /workspace/monitoring/feedback_events.jsonl "
+            "--report-path /workspace/monitoring/post_deploy_health_retrain.json "
+            "--window-size 300 "
+            "--min-samples 20 "
+            "--min-avg-confidence 0.55 "
+            "--uncertain-threshold 0.50 "
+            "--max-uncertain-rate 0.45 "
+            "--min-feedback-samples 10 "
+            "--min-feedback-accuracy 0.75"
+        ),
+    )
+
+    retrain_post_deploy_decision = BranchPythonOperator(
+        task_id="retrain_post_deploy_decision",
+        python_callable=_branch_post_deploy_health,
+        op_kwargs={
+            "report_file": "post_deploy_health_retrain.json",
+            "healthy_task_id": "retrain_done",
+            "rollback_task_id": "retrain_rollback",
+        },
+    )
+
+    retrain_rollback = BashOperator(
+        task_id="retrain_rollback",
+        bash_command=(
+            f"cd {ROOT} && "
+            "python3 -m src.mlops.deployment_manager "
+            "--action rollback "
+            "--target-model-path resnet101/model_trained/ResNet101.pth "
+            "--state-path monitoring/deployment_state.json "
+            "--rollback-history-path monitoring/rollback_history.jsonl "
+            "--reason retrain_post_deploy_degraded "
+            "--allow-noop-rollback"
+        ),
+    )
+
+    retrain_redeploy_after_rollback = BashOperator(
+        task_id="retrain_redeploy_after_rollback",
+        bash_command=f"cd {ROOT} && docker compose -f {COMPOSE} up -d deploy",
+    )
+
+    retrain_gate_failed_rollback = BashOperator(
+        task_id="retrain_gate_failed_rollback",
+        bash_command=(
+            f"cd {ROOT} && "
+            "python3 -m src.mlops.deployment_manager "
+            "--action rollback "
+            "--target-model-path resnet101/model_trained/ResNet101.pth "
+            "--state-path monitoring/deployment_state.json "
+            "--rollback-history-path monitoring/rollback_history.jsonl "
+            "--reason retrain_quality_gate_failed "
+            "--allow-noop-rollback"
         ),
     )
 
     skip_retraining = EmptyOperator(task_id="skip_retraining")
 
-    retrain_join = EmptyOperator(
-        task_id="retrain_join",
+    retrain_done = EmptyOperator(
+        task_id="retrain_done",
         trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
     )
 
-    orchestration_report = PythonOperator(
+    write_orchestration_report = PythonOperator(
         task_id="write_orchestration_report",
         python_callable=_write_orchestration_report,
     )
 
     end = EmptyOperator(task_id="end")
 
-    bootstrap_decision >> bootstrap_ingestion >> bootstrap_training >> bootstrap_deploy >> bootstrap_join
-    bootstrap_decision >> bootstrap_skip >> bootstrap_join
+    bootstrap_decision >> bootstrap_ingestion >> bootstrap_training >> bootstrap_quality_gate >> bootstrap_gate_decision
+    bootstrap_gate_decision >> bootstrap_promote >> bootstrap_deploy >> bootstrap_post_deploy_health >> bootstrap_post_deploy_decision
+    bootstrap_post_deploy_decision >> bootstrap_rollback >> bootstrap_redeploy_after_rollback >> bootstrap_ready
+    bootstrap_post_deploy_decision >> bootstrap_ready
+    bootstrap_gate_decision >> bootstrap_gate_failed_rollback >> bootstrap_ready
+    bootstrap_decision >> bootstrap_skip >> bootstrap_ready
 
-    bootstrap_join >> ensure_deploy
-    ensure_deploy >> [detect_drift, evaluate_health] >> retrain_decision
+    bootstrap_ready >> ensure_deploy_running
+    ensure_deploy_running >> [detect_drift, evaluate_model_health] >> retrain_decision
 
-    retrain_decision >> trigger_retraining >> rollout_new_model >> retrain_join
-    retrain_decision >> skip_retraining >> retrain_join
+    retrain_decision >> retrain_training >> retrain_quality_gate >> retrain_gate_decision
+    retrain_gate_decision >> retrain_promote >> rollout_new_model >> retrain_post_deploy_health >> retrain_post_deploy_decision
+    retrain_post_deploy_decision >> retrain_rollback >> retrain_redeploy_after_rollback >> retrain_done
+    retrain_post_deploy_decision >> retrain_done
+    retrain_gate_decision >> retrain_gate_failed_rollback >> retrain_done
+    retrain_decision >> skip_retraining >> retrain_done
 
-    retrain_join >> orchestration_report >> end
+    retrain_done >> write_orchestration_report >> end
+

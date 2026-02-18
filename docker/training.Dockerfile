@@ -17,5 +17,4 @@ RUN pip install --no-cache-dir -r requirements-mlops.txt
 
 COPY . .
 
-CMD ["python3", "-m", "resnet101.src.training.train_mlflow"]
-
+CMD ["python3", "resnet101/scripts/cli_train.py"]

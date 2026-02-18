@@ -17,5 +17,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python3", "-m", "resnet101.src.data.ingest_data"]
-
+CMD ["python3", "resnet101/scripts/cli_ingest.py"]
