@@ -19,6 +19,7 @@ from src.inference.pipeline import (
     prepare_from_url,)
 
 from src.inference.validate import InvalidImageError
+from src.mlops.inference_monitor import safe_log_inference_event
 from src.utils.config import get_config
 
 from advance_visualization.graphs_advance import (
@@ -117,6 +118,16 @@ async def predict(
 
     scores: Dict[str, float] = {id_to_label.get(i, str(i)): float(p) for i, p in enumerate(probs)}
     label = max(scores.items(), key=lambda kv: kv[1])[0]
+    source = "file" if file is not None else "url"
+
+    safe_log_inference_event(
+        tensor=x,
+        scores=scores,
+        endpoint="/predict",
+        source=source,
+        model_version=get_model_version(),
+        device=get_device(),
+    )
 
     meta.update(
         {
@@ -160,6 +171,16 @@ async def predict_advanced(
 
     scores: Dict[str, float] = {id_to_label.get(i, str(i)): float(p) for i, p in enumerate(probs)}
     label = max(scores.items(), key=lambda kv: kv[1])[0]
+    source = "file" if file is not None else "url"
+
+    safe_log_inference_event(
+        tensor=x,
+        scores=scores,
+        endpoint="/predict/advanced",
+        source=source,
+        model_version=get_model_version(),
+        device=get_device(),
+    )
 
     requested: List[str] = (
         ["kernels", "feature_maps", "gradcam", "integrated_gradients", "occlusion"]

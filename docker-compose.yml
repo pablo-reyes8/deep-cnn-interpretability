@@ -1,14 +1,48 @@
 services:
-  api:
-    image: mi_app:latest_final
-    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+  ingestion:
+    build:
+      context: .
+      dockerfile: docker/ingestion.Dockerfile
+    command: >-
+      python3 -m resnet101.src.data.ingest_data
+      --data-dir /workspace/data
+      --stats-path /workspace/data/pet_stats.json
+      --report-path /workspace/monitoring/ingestion_report.json
+    volumes:
+      - ./data:/workspace/data
+      - ./monitoring:/workspace/monitoring
+    restart: "no"
+
+  training:
+    build:
+      context: .
+      dockerfile: docker/training.Dockerfile
+    command: >-
+      python3 -m resnet101.src.training.train_mlflow
+      --config /workspace/resnet101/oxford_pets_binary_resnet101.yaml
+      --output-dir /workspace/resnet101/model_trained/mlops
+      --tracking-uri file:/workspace/resnet101/mlruns
+    volumes:
+      - ./data:/workspace/data
+      - ./resnet101:/workspace/resnet101
+      - ./monitoring:/workspace/monitoring
+    depends_on:
+      ingestion:
+        condition: service_completed_successfully
+    restart: "no"
+
+  deploy:
+    build:
+      context: .
+      dockerfile: docker/deploy.Dockerfile
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
-
-  ui:
-    image: mi_app:latest_final
-    command: streamlit run app/app.py --server.address=0.0.0.0 --server.port=8501
-    ports:
-      - "8501:8501"
-    depends_on:
-      - api
+    environment:
+      ENABLE_INFERENCE_LOGGING: "true"
+      INFERENCE_LOG_PATH: /workspace/monitoring/inference_events.jsonl
+    volumes:
+      - ./data:/workspace/data
+      - ./resnet101:/workspace/resnet101
+      - ./monitoring:/workspace/monitoring
+    restart: unless-stopped

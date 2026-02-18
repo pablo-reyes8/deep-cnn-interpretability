@@ -204,6 +204,9 @@ cython_debug/
 # MLOps artifacts
 resnet101/mlruns/
 resnet101/model_trained/mlops/
+monitoring/*.json
+monitoring/*.jsonl
+!monitoring/.gitkeep
 
 # Marimo
 marimo/_static/
